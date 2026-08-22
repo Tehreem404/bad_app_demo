@@ -57,8 +57,6 @@ def index():
     status = 200
     chaos = _get_chaos_state()
 
-    time.sleep(1.0)
-
     if chaos["latency"]:
         time.sleep(random.uniform(1.5, 3.0))
     else:
