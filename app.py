@@ -27,34 +27,10 @@ METRIC_DIMENSIONS = [{"Name": "App", "Value": "bad-app-ec2"}]
 
 PORT = int(os.environ.get("PORT", "8000"))
 
-# How many recent requests to score against each other. Bigger batch, better
-# signal.
-SCORE_BATCH = 6000
-
 _lock = threading.Lock()
 _latency_samples = []
-_quality_samples = []
 _error_count = 0
 _request_count = 0
-
-
-def _rank_all(values):
-    """Rank every sample against the rest of the batch."""
-    ranks = []
-    for value in values:
-        position = 0
-        for other in values:
-            if other < value:
-                position += 1
-        ranks.append(position)
-    return ranks
-
-
-def _score_request():
-    """Traffic quality score: this request's standing in the recent batch."""
-    values = [random.random() for _ in range(SCORE_BATCH)]
-    ranks = _rank_all(values)
-    return sum(ranks) / float(len(ranks))
 
 
 @app.route("/")
@@ -64,12 +40,10 @@ def index():
     status = 200
 
     time.sleep(random.uniform(0.01, 0.05))
-    quality = _score_request()
 
     elapsed = time.time() - start
     with _lock:
         _latency_samples.append(elapsed)
-        _quality_samples.append(quality)
         _request_count += 1
         if status == 500:
             _error_count += 1
