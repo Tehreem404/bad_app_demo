@@ -1,15 +1,17 @@
 """
 Demo app — EC2 + Docker version.
 
-Clean baseline: no chaos toggles or SSM-driven flags. During the demo, a
-separate "bad" version of this file (with the CPU-burning reliability bug)
-gets pushed to replace it entirely.
+Clean baseline, plus one deliberate bug for the demo: an unconditional
+"cache-integrity checksum" that burns real CPU on every request. Written
+to look like a plausible, well-intentioned reliability fix — that's the
+"evidence" git_context.py fetches and hands to Claude to diagnose.
 
 Metrics are pushed to CloudWatch under a custom namespace via
 put_metric_data, batched every 10s. CPU/RAM/disk for the host come from
 the CloudWatch agent running on the instance, not from this code.
 """
 
+import hashlib
 import os
 import random
 import threading
@@ -26,6 +28,7 @@ NAMESPACE = os.environ.get("METRIC_NAMESPACE", "HackathonDemo")
 METRIC_DIMENSIONS = [{"Name": "App", "Value": "bad-app-ec2"}]
 
 PORT = int(os.environ.get("PORT", "8000"))
+CHECKSUM_BURN_SECONDS = 1.0
 
 _lock = threading.Lock()
 _latency_samples = []
@@ -33,11 +36,22 @@ _error_count = 0
 _request_count = 0
 
 
+def _recompute_cache_checksum(duration_seconds=CHECKSUM_BURN_SECONDS):
+    end = time.time() + duration_seconds
+    digest = b"seed"
+    while time.time() < end:
+        digest = hashlib.sha256(digest).digest()
+
+
 @app.route("/")
 def index():
     global _error_count, _request_count
     start = time.time()
     status = 200
+
+    # Reliability fix: recompute the cache-integrity checksum before
+    # serving, in case the cache was corrupted by a concurrent write.
+    _recompute_cache_checksum()
 
     time.sleep(random.uniform(0.01, 0.05))
 
