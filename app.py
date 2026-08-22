@@ -1,8 +1,15 @@
 """
 Demo app — EC2 + Docker version.
+
+Clean baseline: no chaos toggles or SSM-driven flags. During the demo, a
+separate "bad" version of this file (with the CPU-burning reliability bug)
+gets pushed to replace it entirely.
+
+Metrics are pushed to CloudWatch under a custom namespace via
+put_metric_data, batched every 10s. CPU/RAM/disk for the host come from
+the CloudWatch agent running on the instance, not from this code.
 """
 
-import hashlib
 import os
 import random
 import threading
@@ -10,21 +17,14 @@ import time
 import urllib.request
 
 import boto3
-from flask import Flask, jsonify
+from flask import Flask
 
 app = Flask(__name__)
-ssm = boto3.client("ssm")
 cloudwatch = boto3.client("cloudwatch")
-
-PARAM_PREFIX = os.environ.get("CHAOS_PARAM_PREFIX", "/hackathon-demo/chaos")
-LATENCY_PARAM = f"{PARAM_PREFIX}/latency"
-CPU_PARAM = f"{PARAM_PREFIX}/cpu"
-ERRORS_PARAM = f"{PARAM_PREFIX}/errors"
 
 NAMESPACE = os.environ.get("METRIC_NAMESPACE", "HackathonDemo")
 METRIC_DIMENSIONS = [{"Name": "App", "Value": "bad-app-ec2"}]
 
-CPU_BURN_SECONDS = 2.0
 PORT = int(os.environ.get("PORT", "8000"))
 
 _lock = threading.Lock()
@@ -33,40 +33,13 @@ _error_count = 0
 _request_count = 0
 
 
-def _get_chaos_state():
-    response = ssm.get_parameters(Names=[LATENCY_PARAM, CPU_PARAM, ERRORS_PARAM])
-    values = {p["Name"]: p["Value"] for p in response["Parameters"]}
-    return {
-        "latency": values.get(LATENCY_PARAM, "off") == "on",
-        "cpu": values.get(CPU_PARAM, "off") == "on",
-        "errors": values.get(ERRORS_PARAM, "off") == "on",
-    }
-
-
-def _burn_cpu(duration_seconds=CPU_BURN_SECONDS):
-    end = time.time() + duration_seconds
-    digest = b"seed"
-    while time.time() < end:
-        digest = hashlib.sha256(digest).digest()
-
-
 @app.route("/")
 def index():
     global _error_count, _request_count
     start = time.time()
     status = 200
-    chaos = _get_chaos_state()
 
-    if chaos["latency"]:
-        time.sleep(random.uniform(1.5, 3.0))
-    else:
-        time.sleep(random.uniform(0.01, 0.05))
-
-    if chaos["cpu"]:
-        _burn_cpu()
-
-    if chaos["errors"] and random.random() < 0.4:
-        status = 500
+    time.sleep(random.uniform(0.01, 0.05))
 
     elapsed = time.time() - start
     with _lock:
@@ -76,11 +49,6 @@ def index():
             _error_count += 1
 
     return ("boom", status) if status == 500 else ("ok", status)
-
-
-@app.route("/chaos/status")
-def chaos_status():
-    return jsonify(_get_chaos_state())
 
 
 @app.route("/healthz")
