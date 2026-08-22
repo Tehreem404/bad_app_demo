@@ -1,0 +1,467 @@
+name: Anomaly Response
+
+# W3: alarm -> EventBridge -> Lambda culprit-dispatch -> repository_dispatch
+# (event_type: anomaly) -> *this workflow* -> diagnose -> PR or Issue.
+#
+# Route chosen: a plain `run:` step calling the Anthropic Messages API
+# directly (curl-equivalent via python's stdlib urllib) instead of
+# anthropics/claude-code-action. See the accompanying report for why.
+#
+# Contract this reads (docs/contracts/dispatch-payload.json in the detector
+# repo, confirmed against the real culprit-dispatch Lambda source in
+# infra/detection.yaml):
+#   client_payload = { alarm_name, state_reason, timestamp, metric_name,
+#                       namespace, threshold, datapoints, region,
+#                       dashboard_url, evidence }
+#   `datapoints` and `evidence` are JSON-encoded STRINGS.
+#   `evidence` keys are fully-qualified CloudWatch SEARCH labels
+#   (e.g. "HackathonDemo/System cpu-total i-091814f7a41456cb0
+#   cpu_usage_active"), not bare metric names -- match on suffix.
+#   One incident can dispatch twice (culprit-*-High and culprit-*-Anomaly
+#   watch the same metric) -- handled below by a concurrency group plus an
+#   open-issue/open-PR label check.
+
+on:
+  repository_dispatch:
+    types: [anomaly]
+  workflow_dispatch:
+    inputs:
+      alarm_name:
+        description: "CloudWatch alarm name, e.g. culprit-App-High"
+        required: false
+        type: string
+        default: "culprit-App-High"
+      state_reason:
+        description: "Alarm state reason text (from CloudWatch)"
+        required: false
+        type: string
+        default: 'Threshold Crossed: 1 out of the last 1 datapoints [2.0601465613753707 (22/08/26 17:19:00)] was greater than the threshold (0.5) (minimum 1 datapoint for OK -> ALARM transition).'
+      timestamp:
+        description: "Alarm state change timestamp (ISO8601)"
+        required: false
+        type: string
+        default: "2026-08-22T17:20:33.259+0000"
+      metric_name:
+        description: "Metric name that fired, e.g. RequestLatency"
+        required: false
+        type: string
+        default: "RequestLatency"
+      namespace:
+        description: "CloudWatch namespace, e.g. HackathonDemo"
+        required: false
+        type: string
+        default: "HackathonDemo"
+      threshold:
+        description: "Alarm threshold value (string; empty if a forced/synthetic test)"
+        required: false
+        type: string
+        default: "0.5"
+      datapoints:
+        description: "JSON-encoded array of recent datapoints"
+        required: false
+        type: string
+        default: "[2.0601465613753707]"
+      region:
+        description: "AWS region"
+        required: false
+        type: string
+        default: "us-east-1"
+      dashboard_url:
+        description: "CloudWatch dashboard URL"
+        required: false
+        type: string
+        default: "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=Culprit"
+      evidence:
+        description: "JSON-encoded evidence object: fully-qualified CloudWatch label -> {before, now, change}"
+        required: false
+        type: string
+        default: '{"HackathonDemo bad-app-ec2 ErrorRate": {"before": 0.0, "now": 0.0, "change": "flat"}, "HackathonDemo bad-app-ec2 RequestLatency": {"before": 0.259, "now": 2.059, "change": "+695%"}, "HackathonDemo/System cpu-total i-091814f7a41456cb0 cpu_usage_active": {"before": 9.685, "now": 27.401, "change": "+183%"}, "HackathonDemo/System i-091814f7a41456cb0 mem_used_percent": {"before": 41.188, "now": 41.276, "change": "flat"}, "HackathonDemo/System nvme0n1p1 xfs i-091814f7a41456cb0 / disk_used_percent": {"before": 30.565, "now": 30.565, "change": "flat"}}'
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+# Both culprit-*-High and culprit-*-Anomaly watch the same metric and can
+# both dispatch for one regression. Group on namespace+metric (not
+# alarm_name, which differs between the two) so a second dispatch for the
+# same incident queues behind the first instead of racing it. The queued
+# run's own idempotency check (open PR/issue with the same label) then
+# no-ops it once the first run has already filed something.
+concurrency:
+  group: anomaly-response-${{ github.event.client_payload.namespace || github.event.inputs.namespace || 'unknown' }}-${{ github.event.client_payload.metric_name || github.event.inputs.metric_name || 'unknown' }}
+  cancel-in-progress: false
+
+jobs:
+  respond:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (full history for git log)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "anomaly-response-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Diagnose incident and open a PR or Issue
+        id: diagnose
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          IN_ALARM_NAME: ${{ github.event.client_payload.alarm_name || github.event.inputs.alarm_name }}
+          IN_STATE_REASON: ${{ github.event.client_payload.state_reason || github.event.inputs.state_reason }}
+          IN_TIMESTAMP: ${{ github.event.client_payload.timestamp || github.event.inputs.timestamp }}
+          IN_METRIC_NAME: ${{ github.event.client_payload.metric_name || github.event.inputs.metric_name }}
+          IN_NAMESPACE: ${{ github.event.client_payload.namespace || github.event.inputs.namespace }}
+          IN_THRESHOLD: ${{ github.event.client_payload.threshold || github.event.inputs.threshold }}
+          IN_DATAPOINTS: ${{ github.event.client_payload.datapoints || github.event.inputs.datapoints }}
+          IN_REGION: ${{ github.event.client_payload.region || github.event.inputs.region }}
+          IN_DASHBOARD_URL: ${{ github.event.client_payload.dashboard_url || github.event.inputs.dashboard_url }}
+          IN_EVIDENCE: ${{ github.event.client_payload.evidence || github.event.inputs.evidence }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timezone
+
+          def env(name, default=""):
+              return os.environ.get(name) or default
+
+          REPO = env("REPO")
+          BASE_BRANCH = env("BASE_BRANCH", "main")
+          ALARM_NAME = env("IN_ALARM_NAME", "unknown-alarm")
+          STATE_REASON = env("IN_STATE_REASON")
+          TIMESTAMP = env("IN_TIMESTAMP")
+          METRIC_NAME = env("IN_METRIC_NAME", "unknown-metric")
+          NAMESPACE = env("IN_NAMESPACE", "unknown-namespace")
+          THRESHOLD = env("IN_THRESHOLD")
+          DATAPOINTS_RAW = env("IN_DATAPOINTS", "[]")
+          REGION = env("IN_REGION", "us-east-1")
+          DASHBOARD_URL = env("IN_DASHBOARD_URL")
+          EVIDENCE_RAW = env("IN_EVIDENCE", "{}")
+
+          def run(cmd, **kw):
+              return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+          # ---- Idempotency: one incident can dispatch twice (the -High and
+          # -Anomaly twins watch the same metric). Fingerprint on
+          # namespace+metric, not alarm_name, so both twins collide on the
+          # same label; skip cleanly if something is already open for it.
+          def slugify(s):
+              s = re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-").lower()
+              return s or "x"
+
+          fingerprint = f"anomaly-{slugify(NAMESPACE)}-{slugify(METRIC_NAME)}"
+          print(f"::notice::incident fingerprint = {fingerprint}")
+
+          def gh_json(args):
+              r = run(["gh"] + args)
+              if r.returncode != 0:
+                  print(f"::warning::gh {' '.join(args)} failed: {r.stderr.strip()}")
+                  return []
+              try:
+                  return json.loads(r.stdout or "[]")
+              except json.JSONDecodeError:
+                  return []
+
+          open_issues = gh_json(["issue", "list", "--repo", REPO, "--label", fingerprint,
+                                  "--state", "open", "--json", "number"])
+          open_prs = gh_json(["pr", "list", "--repo", REPO, "--label", fingerprint,
+                               "--state", "open", "--json", "number"])
+          if open_issues or open_prs:
+              print(f"::notice::an open PR/issue already exists for {fingerprint} "
+                    f"(issues={open_issues}, prs={open_prs}); this is a duplicate "
+                    f"dispatch for the same incident. Nothing to do.")
+              sys.exit(0)
+
+          # Best-effort label so the check above (and any human triage) can find
+          # this incident again. Not fatal if it fails -- we just drop --label.
+          label_ok = run(["gh", "label", "create", fingerprint, "--repo", REPO,
+                           "--color", "d93f0b", "--force",
+                           "--description", "Auto-filed by anomaly-response.yml"]).returncode == 0
+
+          # ---- Evidence: keys are fully-qualified CloudWatch SEARCH labels
+          # (namespace + dimensions + metric name, space separated), NOT bare
+          # metric names -- evidence['RequestLatency'] would KeyError. Match by
+          # suffix instead, and also keep the raw evidence for the model.
+          try:
+              evidence = json.loads(EVIDENCE_RAW)
+          except json.JSONDecodeError:
+              evidence = {}
+
+          def find_by_suffix(suffix):
+              for k, v in evidence.items():
+                  if k.endswith(suffix):
+                      return k, v
+              return None, None
+
+          story_metrics = [
+              ("RequestLatency", "request latency"),
+              ("ErrorRate", "error rate"),
+              ("cpu_usage_active", "CPU usage"),
+              ("mem_used_percent", "memory usage"),
+              ("disk_used_percent", "disk usage"),
+          ]
+          story_lines = []
+          matched_keys = set()
+          for suffix, label in story_metrics:
+              k, v = find_by_suffix(suffix)
+              if k is not None:
+                  matched_keys.add(k)
+                  story_lines.append(
+                      f"- {label} ({k}): before={v.get('before')} now={v.get('now')} change={v.get('change')}")
+          for k, v in evidence.items():
+              if k not in matched_keys:
+                  story_lines.append(f"- {k}: before={v.get('before')} now={v.get('now')} change={v.get('change')}")
+          evidence_story = "\n".join(story_lines) if story_lines else "(no evidence metrics parsed)"
+
+          # ---- git log -p -3 on the checked-out history, to find the culprit commit.
+          log = run(["git", "log", "-p", "-3"])
+          git_log_text = log.stdout if log.returncode == 0 else f"(git log failed: {log.stderr})"
+          MAX_LOG_CHARS = 40_000
+          if len(git_log_text) > MAX_LOG_CHARS:
+              git_log_text = git_log_text[:MAX_LOG_CHARS] + "\n... (truncated)"
+
+          # Built as a list of already-safe, consistently-indented single-line
+          # string literals (rather than a multi-line triple-quoted string) so
+          # nothing in the prompt text can ever be less-indented than this
+          # YAML block scalar -- that's the #1 way this kind of embedded
+          # script silently truncates itself.
+          prompt_lines = [
+              "You are on-call for a hackathon demo app. A CloudWatch alarm fired",
+              "and dispatched this incident to you. Diagnose it and either fix it or file an issue.",
+              "",
+              "## Alarm",
+              f"- alarm_name: {ALARM_NAME}",
+              f"- namespace: {NAMESPACE}",
+              f"- metric_name: {METRIC_NAME}",
+              f"- threshold: {THRESHOLD!r} (empty string means this was a forced/synthetic test "
+              "with no real CloudWatch evaluation data)",
+              f"- datapoints: {DATAPOINTS_RAW}",
+              f"- state_reason: {STATE_REASON}",
+              f"- timestamp: {TIMESTAMP}",
+              f"- region: {REGION}",
+              f"- dashboard: {DASHBOARD_URL}",
+              "",
+              "## Evidence (before/after the incident, gathered at alarm time across the app's",
+              '## CloudWatch namespaces; "before" is ~5min pre-incident, "now" is the last ~30s)',
+              evidence_story,
+              "",
+              "Raw evidence JSON (fully-qualified CloudWatch SEARCH labels as keys -- do not assume",
+              f"bare metric names): {json.dumps(evidence)}",
+              "",
+              "## Recent history (`git log -p -3` on the current branch, most recent first)",
+              "```",
+              git_log_text,
+              "```",
+              "",
+              "## Your job",
+              "1. Read the evidence to understand the shape of the regression (e.g. latency and CPU",
+              "   rising together while error rate/memory/disk stay flat points at a compute",
+              "   regression in application code, not load or a leak -- but read what's actually",
+              "   there, don't assume this pattern).",
+              "2. Look at the 3 most recent commits above and identify which one plausibly caused it.",
+              "3. Decide: can you confidently write a small, safe, targeted fix as a unified diff",
+              "   against the current working tree (paths relative to the repo root, applicable with",
+              "   `git apply`)? If yes, do that. If you are NOT confident (ambiguous cause, fix would",
+              "   be speculative or risky, or you can't isolate a single commit), do NOT guess --",
+              "   instead prepare a GitHub issue describing the incident and your best-effort analysis",
+              "   for a human to pick up.",
+              "",
+              "## Output format",
+              "Respond with ONLY a single JSON object, no markdown fences, no commentary before or",
+              "after it. Schema:",
+              "{",
+              '  "action": "pr" | "issue",',
+              '  "suspect_commit": "<short sha or \'unknown\'>",',
+              '  "title": "<short title for the PR or issue>",',
+              '  "body": "<markdown body: what you observed, why you believe this is the cause, '
+              'and what you did or recommend>",',
+              '  "branch_name": "<only if action is \'pr\': a short kebab-case branch name>",',
+              '  "commit_message": "<only if action is \'pr\': a one-line commit message>",',
+              '  "diff": "<only if action is \'pr\': a unified diff (git diff format, with a/ b/ '
+              'prefixes) that applies cleanly with `git apply` from the repo root; null otherwise>"',
+              "}",
+          ]
+          prompt = "\n".join(prompt_lines)
+
+          if not os.environ.get("ANTHROPIC_API_KEY"):
+              print("::error::ANTHROPIC_API_KEY is not set; cannot diagnose.")
+              sys.exit(1)
+
+          body = json.dumps({
+              "model": "claude-opus-5",
+              "max_tokens": 8000,
+              "messages": [{"role": "user", "content": prompt}],
+          }).encode("utf-8")
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=body,
+              method="POST",
+              headers={
+                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json",
+              },
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=170) as resp:
+                  api_response = json.loads(resp.read().decode("utf-8"))
+          except urllib.error.HTTPError as exc:
+              detail = exc.read().decode("utf-8", errors="replace")[:2000]
+              print(f"::error::Anthropic API {exc.code}: {detail}")
+              sys.exit(1)
+
+          if api_response.get("stop_reason") == "refusal":
+              print(f"::error::Anthropic API refused: {api_response.get('stop_details')}")
+              sys.exit(1)
+
+          text_parts = [b.get("text", "") for b in api_response.get("content", []) if b.get("type") == "text"]
+          raw_text = "\n".join(text_parts).strip()
+
+          # Strip accidental markdown fences even though the prompt asks for none.
+          fence_match = re.match(r"^```(?:json)?\s*\n(.*)\n```$", raw_text, re.DOTALL)
+          if fence_match:
+              raw_text = fence_match.group(1)
+
+          try:
+              verdict = json.loads(raw_text)
+          except json.JSONDecodeError as exc:
+              print(f"::error::Could not parse Claude's response as JSON: {exc}\n---\n{raw_text[:3000]}")
+              sys.exit(1)
+
+          action = verdict.get("action")
+          title = verdict.get("title") or f"Anomaly: {ALARM_NAME}"
+          body_md = verdict.get("body") or "(no body provided)"
+          footer = (
+              f"\n\n---\n*Filed automatically by `anomaly-response.yml` for `{fingerprint}` "
+              f"(alarm `{ALARM_NAME}`, suspect commit `{verdict.get('suspect_commit', 'unknown')}`).*"
+          )
+          body_md_full = body_md + footer
+
+          label_args = ["--label", fingerprint] if label_ok else []
+
+          def file_issue(extra_title_suffix=""):
+              with open("/tmp/issue_body.md", "w") as f:
+                  f.write(body_md_full)
+              cmd = ["gh", "issue", "create", "--repo", REPO,
+                     "--title", title + extra_title_suffix,
+                     "--body-file", "/tmp/issue_body.md"] + label_args
+              r = run(cmd)
+              if r.returncode != 0:
+                  print(f"::error::gh issue create failed: {r.stderr}")
+                  sys.exit(1)
+              print(f"::notice::Opened issue: {r.stdout.strip()}")
+
+          if action == "pr" and verdict.get("diff"):
+              branch = verdict.get("branch_name") or f"anomaly-fix-{fingerprint}"
+              branch = re.sub(r"[^A-Za-z0-9/_-]+", "-", branch).strip("-") or f"anomaly-fix-{fingerprint}"
+              commit_message = verdict.get("commit_message") or title
+
+              with open("/tmp/fix.diff", "w") as f:
+                  f.write(verdict["diff"])
+                  if not verdict["diff"].endswith("\n"):
+                      f.write("\n")
+
+              run(["git", "checkout", "-b", branch])
+              check = run(["git", "apply", "--check", "/tmp/fix.diff"])
+              if check.returncode != 0:
+                  print(f"::warning::diff does not apply cleanly ({check.stderr.strip()}); "
+                        f"falling back to filing an issue instead.")
+                  run(["git", "checkout", BASE_BRANCH])
+                  file_issue(" (auto-generated fix did not apply; filed as issue)")
+              else:
+                  run(["git", "apply", "/tmp/fix.diff"])
+                  run(["git", "add", "-A"])
+                  commit = run(["git", "commit", "-m", commit_message])
+                  if commit.returncode != 0:
+                      print(f"::warning::nothing to commit after applying diff ({commit.stderr.strip()}); "
+                            f"falling back to filing an issue instead.")
+                      run(["git", "checkout", BASE_BRANCH])
+                      file_issue(" (auto-generated fix produced no changes; filed as issue)")
+                  else:
+                      push = run(["git", "push", "-u", "origin", branch])
+                      if push.returncode != 0:
+                          print(f"::error::git push failed: {push.stderr}")
+                          sys.exit(1)
+                      with open("/tmp/pr_body.md", "w") as f:
+                          f.write(body_md_full)
+                      cmd = ["gh", "pr", "create", "--repo", REPO,
+                             "--base", BASE_BRANCH, "--head", branch,
+                             "--title", title, "--body-file", "/tmp/pr_body.md"] + label_args
+                      r = run(cmd)
+                      if r.returncode != 0:
+                          print(f"::error::gh pr create failed: {r.stderr}")
+                          sys.exit(1)
+                      print(f"::notice::Opened PR: {r.stdout.strip()}")
+          else:
+              file_issue()
+          PYEOF
+
+      - name: Fallback -- file raw evidence as an issue (only if the job above failed)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          IN_ALARM_NAME: ${{ github.event.client_payload.alarm_name || github.event.inputs.alarm_name }}
+          IN_STATE_REASON: ${{ github.event.client_payload.state_reason || github.event.inputs.state_reason }}
+          IN_TIMESTAMP: ${{ github.event.client_payload.timestamp || github.event.inputs.timestamp }}
+          IN_METRIC_NAME: ${{ github.event.client_payload.metric_name || github.event.inputs.metric_name }}
+          IN_NAMESPACE: ${{ github.event.client_payload.namespace || github.event.inputs.namespace }}
+          IN_THRESHOLD: ${{ github.event.client_payload.threshold || github.event.inputs.threshold }}
+          IN_DATAPOINTS: ${{ github.event.client_payload.datapoints || github.event.inputs.datapoints }}
+          IN_REGION: ${{ github.event.client_payload.region || github.event.inputs.region }}
+          IN_DASHBOARD_URL: ${{ github.event.client_payload.dashboard_url || github.event.inputs.dashboard_url }}
+          IN_EVIDENCE: ${{ github.event.client_payload.evidence || github.event.inputs.evidence }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "The anomaly-response workflow failed before it could diagnose or"
+            echo "file a proper PR/issue. Here is the raw incident payload so nothing"
+            echo "is lost. See the failed run for the actual error: $RUN_URL"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| alarm_name | ${IN_ALARM_NAME:-} |"
+            echo "| namespace | ${IN_NAMESPACE:-} |"
+            echo "| metric_name | ${IN_METRIC_NAME:-} |"
+            echo "| threshold | ${IN_THRESHOLD:-} |"
+            echo "| datapoints | ${IN_DATAPOINTS:-} |"
+            echo "| region | ${IN_REGION:-} |"
+            echo "| timestamp | ${IN_TIMESTAMP:-} |"
+            echo "| dashboard_url | ${IN_DASHBOARD_URL:-} |"
+            echo "| state_reason | ${IN_STATE_REASON:-} |"
+            echo
+            echo "Raw evidence JSON:"
+            echo '```json'
+            echo "${IN_EVIDENCE:-\{\}}"
+            echo '```'
+          } > /tmp/fallback_issue_body.md
+          # Make sure the label exists before relying on it -- `gh issue create
+          # --label` HARD FAILS if the label is missing, which would mean this
+          # safety net silently files nothing on a brand-new repo. Never let
+          # a label problem be the reason the demo ends with "nothing happened".
+          LABEL_ARGS=()
+          if gh label create "anomaly-response-failure" --repo "$REPO" \
+              --color "b60205" --force \
+              --description "Auto-filed when anomaly-response.yml itself failed" 2>/dev/null; then
+            LABEL_ARGS=(--label "anomaly-response-failure")
+          fi
+          gh issue create --repo "$REPO" \
+            --title "Anomaly response failed: ${IN_ALARM_NAME:-unknown alarm}" \
+            --body-file /tmp/fallback_issue_body.md \
+            "${LABEL_ARGS[@]}" || true
