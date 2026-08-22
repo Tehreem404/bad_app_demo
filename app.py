@@ -143,6 +143,7 @@ def _generate_traffic():
         time.sleep(0.2)
 
 
+# Deploy pipeline test - proves push -> EC2 auto-deploy works
 if __name__ == "__main__":
     threading.Thread(target=_flush_metrics, daemon=True).start()
     threading.Thread(target=_generate_traffic, daemon=True).start()
